@@ -11,11 +11,13 @@ import type { SocketConnectionService } from "./socket-connection-service";
 import type { VaultService } from "./vault-service";
 
 export type CoordinatorApi = CoordinatorApplicationPort & {
+	setSyncPause: VaultService["setSyncPause"];
 	prepareSocketSession(
 		token: string | null | undefined,
 		vaultId: string,
 	): Promise<SocketSession>;
 	completeSocketOpen(): Promise<void>;
+	assertSessionAccess(session: SocketSession): void;
 	readSyncPause(vaultId: string): SyncPauseState | null;
 	detachLocalVault(session: SocketSession): Promise<void>;
 	stageBlob(
@@ -24,11 +26,7 @@ export type CoordinatorApi = CoordinatorApplicationPort & {
 		blobId: string,
 		sizeBytes: number,
 	): Promise<void>;
-	abortStagedBlob(
-		token: string | null | undefined,
-		vaultId: string,
-		blobId: string,
-	): Promise<void>;
+	abortStagedBlob(vaultId: string, blobId: string): Promise<void>;
 	deleteBlob(
 		token: string | null | undefined,
 		vaultId: string,
@@ -54,9 +52,11 @@ export type CoordinatorApiServices = {
 
 export function bindCoordinatorApi(services: CoordinatorApiServices): CoordinatorApi {
 	return {
+		setSyncPause: (vaultId, reason) => services.vaultService.setSyncPause(vaultId, reason),
 		prepareSocketSession: (token, vaultId) =>
 			services.socketConnectionService.prepareSocketSession(token, vaultId),
 		completeSocketOpen: () => services.socketConnectionService.completeSocketOpen(),
+		assertSessionAccess: (session) => services.socketConnectionService.assertSessionAccess(session),
 		readSyncPause: (vaultId) => services.vaultService.readSyncPause(vaultId),
 		repairSyncState: (vaultId) => services.vaultService.repairSyncState(vaultId),
 		listEntryStates: (session, message) =>
@@ -74,8 +74,8 @@ export function bindCoordinatorApi(services: CoordinatorApiServices): Coordinato
 			services.entryService.purgeDeletedEntries(session, message),
 		stageBlob: (token, vaultId, blobId, sizeBytes) =>
 			services.blobService.stageBlob(token, vaultId, blobId, sizeBytes),
-		abortStagedBlob: (token, vaultId, blobId) =>
-			services.blobService.abortStagedBlob(token, vaultId, blobId),
+		abortStagedBlob: (vaultId, blobId) =>
+			services.blobService.abortStagedBlob(vaultId, blobId),
 		deleteBlob: (token, vaultId, blobId) =>
 			services.blobService.deleteBlob(token, vaultId, blobId),
 		applyVaultPolicy: (vaultId, limits) =>

@@ -18,8 +18,10 @@ export class JoseSyncTokenCodec implements SyncTokenCodec {
 
 	async signSyncToken(claims: SyncTokenClaims): Promise<string> {
 		return await new SignJWT({
+			accessVersion: claims.accessVersion,
 			vaultId: claims.vaultId,
 			localVaultId: claims.localVaultId,
+			displayName: claims.displayName,
 			scope: claims.scope,
 		})
 			.setProtectedHeader({

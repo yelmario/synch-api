@@ -4,11 +4,8 @@ const MAINTENANCE_RETRY_MAX_MS = 15 * 60 * 1000;
 const BLOB_GC_ALARM_BUCKET_MS = 30 * 60 * 1000;
 
 import type {
-	MaintenanceJobHandler,
 	MaintenanceJobHandlers,
 	MaintenanceJobKey,
-	MaintenanceRunner,
-	MaintenanceScheduler,
 } from "../../../application/ports/outbound";
 
 type MaintenanceJob = {
@@ -54,7 +51,10 @@ export class CoordinatorMaintenanceScheduler {
 		await this.rearm();
 	}
 
-	async drain(handlers: MaintenanceJobHandlers, now = Date.now()): Promise<void> {
+	async drain(
+		handlers: MaintenanceJobHandlers,
+		now = Date.now(),
+	): Promise<void> {
 		for (let i = 0; i < MAX_DRAINED_JOBS_PER_ALARM; i += 1) {
 			const job = this.readNextDueJob(now);
 			if (!job) {
@@ -62,7 +62,9 @@ export class CoordinatorMaintenanceScheduler {
 			}
 
 			try {
-				const nextDueAt = await handlers[job.key](now);
+				const handler = handlers[job.key];
+				if (!handler) throw new Error(`No maintenance handler for ${job.key}`);
+				const nextDueAt = await handler(now);
 				if (nextDueAt === null) {
 					this.deleteJob(job.key);
 				} else {
@@ -172,7 +174,10 @@ export class CoordinatorMaintenanceScheduler {
 	}
 
 	private deleteJob(key: MaintenanceJobKey): void {
-		this.ctx.storage.sql.exec("DELETE FROM maintenance_jobs WHERE key = ?", key);
+		this.ctx.storage.sql.exec(
+			"DELETE FROM maintenance_jobs WHERE key = ?",
+			key,
+		);
 	}
 
 	private rescheduleJob(
@@ -227,7 +232,10 @@ export class CoordinatorMaintenanceScheduler {
 }
 
 function isMaintenanceJobKey(value: string): value is MaintenanceJobKey {
-	return value === "blob_gc" || value === "health_summary_flush";
+	return (
+		value === "blob_gc" ||
+		value === "health_summary_flush"
+	);
 }
 
 function maintenanceRetryDelayMs(retryCount: number): number {

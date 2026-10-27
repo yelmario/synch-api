@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { MAX_REPAIRABLE_STALE_STAGED_BLOBS, VaultService } from "./vault-service";
+import {
+	MAX_REPAIRABLE_STALE_STAGED_BLOBS,
+	VaultService,
+} from "./vault-service";
 import { stageBlobForTest } from "../../test-helpers";
 import {
 	closeAllTestSqliteCoordinators,
 	createSqliteCoordinator,
+	testSession,
 } from "../../adapters/outbound/sqlite/test-helpers";
 import { STAGED_BLOB_STALE_MS } from "../../domain/health-policy";
 import type { BlobObjectRepository } from "../ports/outbound";
@@ -23,7 +27,7 @@ describe("VaultService sync repair", () => {
 		const sqlite = await createSqliteCoordinator();
 		const now = Date.now();
 		stageBlobForTest(
-			sqlite.blobStore,
+			sqlite.unitOfWork,
 			"blob-stale",
 			100,
 			now - STAGED_BLOB_STALE_MS - 1,
@@ -59,7 +63,7 @@ describe("VaultService sync repair", () => {
 		const sqlite = await createSqliteCoordinator();
 		const now = Date.now();
 		stageBlobForTest(
-			sqlite.blobStore,
+			sqlite.unitOfWork,
 			"blob-referenced",
 			100,
 			now - STAGED_BLOB_STALE_MS - 1,
@@ -113,7 +117,10 @@ describe("VaultService sync repair", () => {
 		);
 		const blobStorage = createBlobStorage();
 
-		const result = await createVaultService(sqlite, blobStorage).repairSyncState("vault-1");
+		const result = await createVaultService(
+			sqlite,
+			blobStorage,
+		).repairSyncState("vault-1");
 
 		expect(result).toMatchObject({
 			status: "repaired",
@@ -129,7 +136,7 @@ describe("VaultService sync repair", () => {
 		const sqlite = await createSqliteCoordinator();
 		const now = Date.now();
 		stageBlobForTest(
-			sqlite.blobStore,
+			sqlite.unitOfWork,
 			"blob-stale",
 			100,
 			now - STAGED_BLOB_STALE_MS - 1,
@@ -146,7 +153,10 @@ describe("VaultService sync repair", () => {
 			}),
 		});
 
-		const result = await createVaultService(sqlite, blobStorage).repairSyncState("vault-1");
+		const result = await createVaultService(
+			sqlite,
+			blobStorage,
+		).repairSyncState("vault-1");
 
 		expect(result).toMatchObject({
 			status: "manual_repair_required",
@@ -164,7 +174,10 @@ describe("VaultService sync repair", () => {
 		vi.spyOn(sqlite.cursorStore, "vaultStateExistsFor").mockReturnValue(false);
 		const blobStorage = createBlobStorage();
 
-		const result = await createVaultService(sqlite, blobStorage).repairSyncState("vault-1");
+		const result = await createVaultService(
+			sqlite,
+			blobStorage,
+		).repairSyncState("vault-1");
 
 		expect(result).toMatchObject({
 			status: "not_paused",
@@ -181,7 +194,7 @@ describe("VaultService sync repair", () => {
 		const sqlite = await createSqliteCoordinator();
 		const now = Date.now();
 		stageBlobForTest(
-			sqlite.blobStore,
+			sqlite.unitOfWork,
 			"blob-stale",
 			100,
 			now - STAGED_BLOB_STALE_MS - 1,
@@ -194,7 +207,10 @@ describe("VaultService sync repair", () => {
 		);
 		const blobStorage = createBlobStorage();
 
-		const result = await createVaultService(sqlite, blobStorage).repairSyncState("vault-1");
+		const result = await createVaultService(
+			sqlite,
+			blobStorage,
+		).repairSyncState("vault-1");
 
 		expect(result).toMatchObject({
 			status: "manual_repair_required",
@@ -220,7 +236,7 @@ describe("VaultService sync repair", () => {
 		const staleCount = MAX_REPAIRABLE_STALE_STAGED_BLOBS + 1;
 		for (let index = 0; index < staleCount; index += 1) {
 			stageBlobForTest(
-				sqlite.blobStore,
+				sqlite.unitOfWork,
 				`blob-stale-${index}`,
 				100,
 				now - STAGED_BLOB_STALE_MS - 1,
@@ -234,7 +250,10 @@ describe("VaultService sync repair", () => {
 		);
 		const blobStorage = createBlobStorage();
 
-		const result = await createVaultService(sqlite, blobStorage).repairSyncState("vault-1");
+		const result = await createVaultService(
+			sqlite,
+			blobStorage,
+		).repairSyncState("vault-1");
 
 		expect(result).toMatchObject({
 			status: "manual_repair_required",
@@ -288,7 +307,48 @@ function createVaultService(
 			},
 		},
 		{ scheduleSummaryFlush: async () => {} },
-		sqlite.staleStagedBlobStore,
+		sqlite.unitOfWork,
 		blobGcService,
 	);
 }
+
+
+describe("manual sync pause", () => {
+	it("persists a manual pause, preserves it across repair, and resumes idempotently", async () => {
+		const sqlite = await createSqliteCoordinator();
+		const service = createVaultService(sqlite, createBlobStorage());
+		const first = service.setSyncPause("vault-1", "excessive requests");
+		expect(first.syncPause).toMatchObject({ reason: "manual: excessive requests" });
+		expect(service.setSyncPause("vault-1", "another reason")).toEqual(first);
+		const fresh = createVaultService(sqlite, createBlobStorage());
+		expect(fresh.readSyncPause("vault-1")).toEqual(first.syncPause);
+		expect(await fresh.repairSyncState("vault-1")).toMatchObject({ status: "manual_repair_required", issue: "unsupported_pause_reason" });
+		expect(fresh.setSyncPause("vault-1", null)).toEqual({ syncPause: null });
+		expect(fresh.setSyncPause("vault-1", null)).toEqual({ syncPause: null });
+	});
+
+	it("does not overwrite or clear an existing repair pause", async () => {
+		const sqlite = await createSqliteCoordinator();
+		sqlite.cursorStore.pauseSync(123, "repair required");
+		const service = createVaultService(sqlite, createBlobStorage());
+		for (const reason of ["excessive requests", null]) {
+			expect(() => service.setSyncPause("vault-1", reason)).toThrow("sync_repair_required");
+		}
+		expect(sqlite.cursorStore.readSyncPause()).toEqual({ pausedAt: 123, reason: "repair required" });
+		expect(() => service.setSyncPause("wrong-vault", null)).toThrow();
+	});
+
+	it("rejects a commit when paused while its asynchronous preflight is running", async () => {
+		const sqlite = await createSqliteCoordinator();
+		const committing = sqlite.mutationService.commitMutations(testSession(), {
+			type: "commit_mutations", requestId: "race", mutations: [{
+				mutationId: "delete-1", entryId: "entry-1", op: "delete", baseRevision: 0,
+				blobId: null, encryptedMetadata: "metadata",
+			}],
+		});
+		sqlite.cursorStore.pauseSync(Date.now(), "manual: stop");
+		await expect(committing).rejects.toMatchObject({ code: "sync_paused" });
+		expect(sqlite.cursorStore.currentCursor()).toBe(0);
+		expect(sqlite.entryStore.readEntry("entry-1")).toBeNull();
+	});
+});

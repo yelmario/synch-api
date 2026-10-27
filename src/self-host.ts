@@ -24,6 +24,8 @@ function createBlobStorage(config: NodeBlobConfig): BlobObjectStorage {
 
 async function main(): Promise<void> {
 	const config = parseNodeServerConfig(process.env);
+	const blobStorage = createBlobStorage(config.blob);
+	if (blobStorage instanceof LocalDiskBlobObjectStorage) await blobStorage.initialize();
 	// Defaults to all interfaces (needed for Docker's port publishing to work
 	// at all - binding to 127.0.0.1 inside a container makes it unreachable
 	// from outside its own network namespace). Set HOST=127.0.0.1 for a
@@ -35,9 +37,13 @@ async function main(): Promise<void> {
 		corsOrigin: config.corsOrigin,
 		betterAuthSecret: config.betterAuthSecret,
 		authAllowedEmails: config.authAllowedEmails,
+		googleClientId: config.googleClientId,
+		googleClientSecret: config.googleClientSecret,
+		githubClientId: config.githubClientId,
+		githubClientSecret: config.githubClientSecret,
 		syncTokenSecret: config.syncTokenSecret,
 		syncTokenTtlSeconds: config.syncTokenTtlSeconds,
-		blobStorage: createBlobStorage(config.blob),
+		blobStorage,
 	});
 
 	const webSockets = createNodeWebSocketUpgradeHandler(runtime, config.publicUrl);
@@ -46,6 +52,11 @@ async function main(): Promise<void> {
 		fetch: (request) => runtime.fetch(request),
 		port: config.port,
 		hostname: config.host,
+		serverOptions: {
+			requestTimeout: config.requestTimeoutMs,
+			headersTimeout: Math.min(60_000, config.requestTimeoutMs),
+			connectionsCheckingInterval: Math.min(30_000, config.requestTimeoutMs),
+		},
 	}) as NodeHttpServer;
 	server.on("upgrade", webSockets.handleUpgrade);
 

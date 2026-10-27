@@ -1,3 +1,4 @@
+import { DrizzleSharingStore } from "../../sharing/adapters/drizzle-sharing-store";
 import type { AppDb } from "../../db/client";
 import type { SubscriptionPolicyReader } from "../../subscription/application";
 import type { VaultPurgeMessage, VaultRetentionEmailMessage } from "../../vault/application";
@@ -16,10 +17,12 @@ import {
 	type CoordinatorPurgeTransport,
 } from "../../vault/adapters/outbound/coordinator-purge-writer";
 import { DrizzleVaultStore } from "../../vault/adapters/outbound/drizzle-vault-store";
-import { VaultApplicationService } from "../../vault/application/use-cases/vault-service";
-import { PurgeVaultUseCase } from "../../vault/application/use-cases/purge-vault";
-import { ReadVaultOrganizationUseCase } from "../../vault/application/use-cases/read-vault-organization";
-import { RunVaultRetentionUseCase } from "../../vault/application/use-cases/run-vault-retention";
+import { VaultApplicationService } from "../../vault/application/services/vault-service";
+import {
+	RunVaultRetentionService,
+	VaultPurgeService,
+} from "../../vault/application/services/vault-lifecycle-service";
+import { VaultOrganizationService } from "../../vault/application/services/vault-organization-service";
 
 export type VaultFeature = {
 	service: VaultService;
@@ -49,7 +52,7 @@ export function createVaultFeature(config: VaultFeatureConfig): VaultFeature {
 		config.emailFrom,
 	);
 	const purgeConsumer = new VaultPurgeConsumer(
-		new PurgeVaultUseCase(
+		new VaultPurgeService(
 			store,
 			new CoordinatorPurgeWriter(config.coordinatorPurgeTransport),
 		),
@@ -67,10 +70,11 @@ export function createVaultFeature(config: VaultFeatureConfig): VaultFeature {
 			store,
 			config.policyReader,
 			purgeQueue,
+			async (userId, organizationId) => { const member = await new DrizzleSharingStore(config.db).membership(organizationId, userId); return member?.role === "owner" || member?.role === "admin"; },
 		),
-		organizationReader: new ReadVaultOrganizationUseCase(store),
+		organizationReader: new VaultOrganizationService(store),
 		purgeConsumer,
-		retention: new RunVaultRetentionUseCase(
+		retention: new RunVaultRetentionService(
 			store,
 			config.policyReader,
 			purgeQueue,
@@ -83,7 +87,7 @@ export function createVaultFeature(config: VaultFeatureConfig): VaultFeature {
 export function createVaultOrganizationReader(
 	db: AppDb,
 ): VaultOrganizationReader {
-	return new ReadVaultOrganizationUseCase(new DrizzleVaultStore(db));
+	return new VaultOrganizationService(new DrizzleVaultStore(db));
 }
 
 export function createVaultRetentionFeature(config: {
@@ -92,7 +96,7 @@ export function createVaultRetentionFeature(config: {
 	vaultPurgeQueue: Queue<VaultPurgeMessage>;
 }): RunVaultRetention {
 	const store = new DrizzleVaultStore(config.db);
-	return new RunVaultRetentionUseCase(
+	return new RunVaultRetentionService(
 		store,
 		config.policyReader,
 		new CloudflareVaultPurgeQueue(config.vaultPurgeQueue),

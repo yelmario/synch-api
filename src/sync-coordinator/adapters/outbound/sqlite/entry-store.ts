@@ -1,3 +1,7 @@
+import type {
+	MutationEntrySnapshot,
+	UpsertEntryInput,
+} from "../../../application/ports/outbound/entry-writes";
 import { eq } from "drizzle-orm";
 
 import * as doSchema from "../../../../db/do";
@@ -20,12 +24,14 @@ export class CoordinatorEntryStore {
 		targetCursor: number,
 		after: EntryStatePageCursor | null,
 		limit: number,
+		entryIds?: readonly string[],
 	): EntryStateRow[] {
 		const rows = this.handle
 			.exec<{
 				entry_id: string;
 				revision: number;
 				blob_id: string | null;
+				blob_size: number | null;
 				encrypted_metadata: string;
 				deleted: number;
 				updated_seq: number;
@@ -39,10 +45,12 @@ export class CoordinatorEntryStore {
 					encrypted_metadata,
 					deleted,
 					updated_seq,
-					updated_at
+					updated_at,
+					(SELECT size_bytes FROM blobs WHERE blobs.blob_id = entries.blob_id) AS blob_size
 				FROM entries
 				WHERE updated_seq > ?
 					AND updated_seq <= ?
+					${entryIds ? "AND entry_id IN (SELECT value FROM json_each(?))" : ""}
 					AND (
 						? IS NULL
 						OR updated_seq > ?
@@ -53,6 +61,7 @@ export class CoordinatorEntryStore {
 				`,
 				sinceCursor,
 				targetCursor,
+				...(entryIds ? [JSON.stringify(entryIds)] : []),
 				after?.updatedSeq ?? null,
 				after?.updatedSeq ?? null,
 				after?.updatedSeq ?? null,
@@ -65,6 +74,7 @@ export class CoordinatorEntryStore {
 			entry_id: row.entry_id,
 			revision: Number(row.revision),
 			blob_id: row.blob_id,
+			blob_size: row.blob_size === null ? null : Number(row.blob_size),
 			encrypted_metadata: row.encrypted_metadata,
 			deleted: Number(row.deleted) !== 0,
 			updated_seq: Number(row.updated_seq),
@@ -72,7 +82,7 @@ export class CoordinatorEntryStore {
 		}));
 	}
 
-	countEntryStates(sinceCursor: number, targetCursor: number): number {
+	countEntryStates(sinceCursor: number, targetCursor: number, entryIds?: readonly string[]): number {
 		const row = this.handle
 			.exec<{ total: number }>(
 				`
@@ -80,9 +90,11 @@ export class CoordinatorEntryStore {
 				FROM entries
 				WHERE updated_seq > ?
 					AND updated_seq <= ?
+					${entryIds ? "AND entry_id IN (SELECT value FROM json_each(?))" : ""}
 				`,
 				sinceCursor,
 				targetCursor,
+				...(entryIds ? [JSON.stringify(entryIds)] : []),
 			)
 			.one();
 
@@ -168,4 +180,63 @@ export class CoordinatorEntryStore {
 			: null;
 	}
 
+	readMutationEntry(entryId: string): MutationEntrySnapshot | null {
+		const row = this.handle.db
+			.select({
+				entryId: doSchema.entries.entryId,
+				revision: doSchema.entries.revision,
+				blobId: doSchema.entries.blobId,
+				encryptedMetadata: doSchema.entries.encryptedMetadata,
+				deleted: doSchema.entries.deleted,
+				updatedSeq: doSchema.entries.updatedSeq,
+				lastMutationId: doSchema.entries.lastMutationId,
+			})
+			.from(doSchema.entries)
+			.where(eq(doSchema.entries.entryId, entryId))
+			.limit(1)
+			.get();
+
+		return row
+			? {
+					entryId: row.entryId,
+					revision: Number(row.revision),
+					blobId: row.blobId,
+					encryptedMetadata: row.encryptedMetadata,
+					deleted: Number(row.deleted) !== 0,
+					updatedSeq: Number(row.updatedSeq),
+					lastMutationId: row.lastMutationId,
+				}
+			: null;
+	}
+	upsertEntry(input: UpsertEntryInput): void {
+		this.handle.db
+			.insert(doSchema.entries)
+			.values({
+				entryId: input.entryId,
+				revision: input.revision,
+				blobId: input.blobId,
+				encryptedMetadata: input.encryptedMetadata,
+				deleted: input.deleted ? 1 : 0,
+				updatedSeq: input.updatedSeq,
+				updatedAt: input.updatedAt,
+				updatedByUserId: input.updatedByUserId,
+				updatedByLocalVaultId: input.updatedByLocalVaultId,
+				lastMutationId: input.lastMutationId,
+			})
+			.onConflictDoUpdate({
+				target: doSchema.entries.entryId,
+				set: {
+					revision: input.revision,
+					blobId: input.blobId,
+					encryptedMetadata: input.encryptedMetadata,
+					deleted: input.deleted ? 1 : 0,
+					updatedSeq: input.updatedSeq,
+					updatedAt: input.updatedAt,
+					updatedByUserId: input.updatedByUserId,
+					updatedByLocalVaultId: input.updatedByLocalVaultId,
+					lastMutationId: input.lastMutationId,
+				},
+			})
+			.run();
+	}
 }

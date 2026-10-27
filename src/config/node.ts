@@ -8,10 +8,16 @@ const optionalNonBlankString = z.preprocess(
 const nodeEnvSchema = z.object({
 	DATA_DIR: optionalNonBlankString.default("./data"),
 	PORT: z.coerce.number().int().min(1).max(65_535).default(8787),
+	// Keep uploads below the coordinator's 30-minute staged-blob GC grace.
+	REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().max(25 * 60_000).default(300_000),
 	HOST: optionalNonBlankString.default("0.0.0.0"),
 	PUBLIC_URL: optionalNonBlankString,
 	CORS_ORIGIN: optionalNonBlankString,
 	BETTER_AUTH_SECRET: z.string().trim().min(1, "BETTER_AUTH_SECRET is required"),
+	GOOGLE_CLIENT_ID: optionalNonBlankString,
+	GOOGLE_CLIENT_SECRET: optionalNonBlankString,
+	GITHUB_CLIENT_ID: optionalNonBlankString,
+	GITHUB_CLIENT_SECRET: optionalNonBlankString,
 	AUTH_ALLOWED_EMAILS: z.string().trim().min(1, "AUTH_ALLOWED_EMAILS is required"),
 	SYNC_TOKEN_SECRET: z.string().trim().min(1, "SYNC_TOKEN_SECRET is required"),
 	SYNC_TOKEN_TTL_SECONDS: z.coerce.number().int().positive().optional(),
@@ -41,11 +47,16 @@ export type NodeBlobConfig =
 export type NodeServerConfig = {
 	host: string;
 	port: number;
+	requestTimeoutMs: number;
 	dataDir: string;
 	publicUrl: string;
 	corsOrigin?: string;
 	betterAuthSecret: string;
 	authAllowedEmails: string;
+	googleClientId?: string;
+	googleClientSecret?: string;
+	githubClientId?: string;
+	githubClientSecret?: string;
 	syncTokenSecret: string;
 	syncTokenTtlSeconds?: number;
 	blob: NodeBlobConfig;
@@ -63,11 +74,16 @@ export function parseNodeServerConfig(
 	return {
 		host: env.HOST,
 		port: env.PORT,
+		requestTimeoutMs: env.REQUEST_TIMEOUT_MS,
 		dataDir: env.DATA_DIR,
 		publicUrl,
 		corsOrigin,
 		betterAuthSecret: env.BETTER_AUTH_SECRET,
 		authAllowedEmails: env.AUTH_ALLOWED_EMAILS,
+		googleClientId: env.GOOGLE_CLIENT_ID,
+		googleClientSecret: env.GOOGLE_CLIENT_SECRET,
+		githubClientId: env.GITHUB_CLIENT_ID,
+		githubClientSecret: env.GITHUB_CLIENT_SECRET,
 		syncTokenSecret: env.SYNC_TOKEN_SECRET,
 		syncTokenTtlSeconds: env.SYNC_TOKEN_TTL_SECONDS,
 		blob: parseBlobConfig(env),

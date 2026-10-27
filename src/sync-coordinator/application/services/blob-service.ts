@@ -1,14 +1,15 @@
+import { LEGACY_PAUSE_QUOTA_COMPATIBILITY } from "../../../sync-access/domain/legacy-pause-compatibility";
 import { SyncCoordinatorApplicationError } from "../errors/coordinator-errors";
-import {
-	decideBlobStage,
-	type BlobStageDecision,
-} from "../../domain/blob-policy";
+import { type BlobStageDecision } from "../../domain/blob-policy";
 import { isBlobPinned } from "../../domain/blob-gc-policy";
-import { STAGED_BLOB_STALE_MS } from "../../domain/health-policy";
+import {
+	stageBlobRecord,
+	accountForDeletedBlobs,
+} from "./blob-record-operations";
 import type {
 	BlobObjectKeyBuilder,
 	BlobObjectRepository,
-	BlobStateStore,
+	CoordinatorUnitOfWork,
 	SocketGateway,
 	SyncTokenVerifier,
 } from "../ports/outbound";
@@ -18,12 +19,11 @@ import type { HealthService } from "./health-service";
 export class BlobService {
 	constructor(
 		private readonly syncTokenService: SyncTokenVerifier,
-		private readonly blobStore: BlobStateStore,
-		private readonly blobGcService: Pick<BlobGcService, "scheduleAt">,
-		private readonly socketService: Pick<
-			SocketGateway,
-			"closeAllSockets"
+		private readonly unitOfWork: CoordinatorUnitOfWork<
+			"blobs" | "blobReferences" | "state"
 		>,
+		private readonly blobGcService: Pick<BlobGcService, "scheduleAt">,
+		private readonly socketService: Pick<SocketGateway, "closeAllSockets">,
 		private readonly blobRepository: BlobObjectRepository,
 		private readonly objectKeyBuilder: BlobObjectKeyBuilder,
 		private readonly blobGracePeriodMs: number,
@@ -42,80 +42,72 @@ export class BlobService {
 		await this.syncTokenService.verifySyncToken(token, vaultId);
 
 		const now = Date.now();
-		const decision = this.blobStore.withStageTransaction(blobId, now, (transaction) => {
-			const { referenceFacts, ...facts } = transaction.readFacts();
-			const next = decideBlobStage({
+		const decision = this.unitOfWork.run((stores) =>
+			stageBlobRecord(
+				stores,
 				blobId,
 				sizeBytes,
 				now,
-				staleAfterMs: STAGED_BLOB_STALE_MS,
-				...facts,
-				isPinned: facts.existing
-					? isBlobPinned(referenceFacts, false)
-					: false,
-			});
+				now + this.blobGracePeriodMs,
+			),
+		);
+		if (decision.kind === "rejected") throwBlobStageError(blobId, decision);
 
-			if (next.kind === "sync_paused") {
-				transaction.pauseSync(now, next.reason);
-				return next;
-			}
-			if (next.kind === "rejected") {
-				throwBlobStageError(blobId, next);
-			}
-
-			transaction.persistStage({
-				sizeBytes,
-				now,
-				deleteAfter: now + this.blobGracePeriodMs,
-				storageDeltaBytes: next.storageDeltaBytes,
-			});
-			return next;
-		});
 		if (decision.kind === "sync_paused") {
-			this.socketService.closeAllSockets(4403, "sync paused for vault repair");
+			// TODO(remove-legacy-pause-quota): Keep the session alive until the
+			// upload's 413 response reaches the client's terminal-stop handler.
+			if (!LEGACY_PAUSE_QUOTA_COMPATIBILITY) {
+				this.socketService.closeAllSockets(1013, "sync paused for vault repair");
+			}
 			throw syncPausedError();
 		}
 
-		await this.blobGcService.scheduleAt(
-			now + this.blobGracePeriodMs,
-			now,
-		);
+		await this.blobGcService.scheduleAt(now + this.blobGracePeriodMs, now);
 		this.healthService.notifyStorageStatusChanged();
 	}
 
-	async abortStagedBlob(
+	/** Internal compensation for an already authenticated upload. Revalidating the
+	 * client's short-lived token here would prevent cleanup after slow transfers. */
+	async abortStagedBlob(vaultId: string, blobId: string): Promise<void> {
+		if (this.unitOfWork.stores.state.readVaultId() !== vaultId) {
+			throw new SyncCoordinatorApplicationError("vault_mismatch");
+		}
+		// Another attempt may already have stored this object or still be uploading.
+		// Keep its row, quota reservation, and grace deadline until GC can delete
+		// the unreferenced object and its record together.
+		const blob = this.unitOfWork.stores.blobs.readBlob(blobId);
+		if (blob?.state === "staged" && blob.delete_after !== null) {
+			const now = Date.now();
+			await this.blobGcService.scheduleAt(Math.max(now, blob.delete_after), now);
+		}
+	}
+
+	async deleteBlob(
 		token: string | null | undefined,
 		vaultId: string,
 		blobId: string,
 	): Promise<void> {
 		await this.syncTokenService.verifySyncToken(token, vaultId);
+		if (this.unitOfWork.stores.state.readSyncPause()) throw syncPausedError();
 		const now = Date.now();
-		this.blobStore.withBlobTransaction(blobId, now, (transaction) => {
-			const facts = transaction.readFacts();
-			if (
-				!facts.blob ||
-				facts.blob.state !== "staged" ||
-				isBlobPinned(facts.referenceFacts, false)
-			) {
-				return;
-			}
-			transaction.deleteStagedBlob();
-		});
-		await this.healthService.scheduleSummaryFlush();
-		this.healthService.notifyStorageStatusChanged();
-	}
-
-	async deleteBlob(token: string | null | undefined, vaultId: string, blobId: string): Promise<void> {
-		await this.syncTokenService.verifySyncToken(token, vaultId);
-		const now = Date.now();
-		const { blob, referenceFacts } = this.blobStore.readBlobFacts(blobId, now);
-		if (blob && isBlobPinned(referenceFacts, false)) {
+		const { blob, referenceFacts } = this.unitOfWork.run((stores) => ({
+			blob: stores.blobs.readBlob(blobId),
+			referenceFacts: stores.blobReferences.read(blobId, now),
+		}));
+		if (blob && isBlobPinned(referenceFacts)) {
 			return;
 		}
 
-		await this.blobRepository.delete(this.objectKeyBuilder.blobObjectKey(vaultId, blobId));
+		await this.blobRepository.delete(
+			this.objectKeyBuilder.blobObjectKey(vaultId, blobId),
+		);
 		if (blob) {
-			this.blobStore.deleteBlobRecord(blobId);
+			this.unitOfWork.run((stores) => {
+				accountForDeletedBlobs(
+					stores.state,
+					stores.blobs.deleteBlobRecord(blobId),
+				);
+			});
 			await this.healthService.scheduleSummaryFlush();
 			this.healthService.notifyStorageStatusChanged();
 		}

@@ -3,22 +3,22 @@ import { describe, expect, it, vi } from "vitest";
 
 import { createDb } from "../../src/db/client";
 import { getSubscriptionPlanPolicy } from "../../src/subscription/domain/policy";
+import { FREE_VAULT_INACTIVITY_DELETE_AFTER_MS } from "../../src/vault/domain/policy";
 import { VaultPurgeConsumer } from "../../src/vault/adapters/inbound/queue/purge-consumer";
 import { VaultRetentionEmailConsumer } from "../../src/vault/adapters/inbound/queue/retention-email-consumer";
 import {
 	CloudflareVaultPurgeQueue,
 } from "../../src/vault/adapters/outbound/purge-queue";
 import type { VaultPurgeMessage, VaultRetentionEmailMessage } from "../../src/vault/application";
-import { PurgeVaultUseCase } from "../../src/vault/application/use-cases/purge-vault";
+import {
+	RunVaultRetentionService,
+	VaultPurgeService,
+} from "../../src/vault/application/services/vault-lifecycle-service";
 import {
 	CloudflareVaultRetentionEmailQueue,
 } from "../../src/vault/adapters/outbound/retention-queue";
 import { DrizzleVaultStore } from "../../src/vault/adapters/outbound/drizzle-vault-store";
 import { EmailRetentionNotificationSender } from "../../src/vault/adapters/outbound/email-retention-notification-sender";
-import {
-	FREE_VAULT_INACTIVITY_DELETE_AFTER_MS,
-} from "../../src/vault/application/use-cases/run-vault-retention";
-import { RunVaultRetentionUseCase } from "../../src/vault/application/use-cases/run-vault-retention";
 import { signUpAndCreateVault } from "../helpers/api";
 
 /**
@@ -41,7 +41,7 @@ function freeRetentionService(
 	repository: DrizzleVaultStore,
 	purgeQueue: CloudflareVaultPurgeQueue,
 ) {
-	return new RunVaultRetentionUseCase(
+	return new RunVaultRetentionService(
 		repository,
 		{ readOrganizationPolicy: async () => getSubscriptionPlanPolicy("free") },
 		purgeQueue,
@@ -96,7 +96,7 @@ describe("vault inactivity retention integration", () => {
 
 		const notices = recordingQueue<VaultRetentionEmailMessage>();
 		const purgeConsumer = new VaultPurgeConsumer(
-			new PurgeVaultUseCase(repository, {
+			new VaultPurgeService(repository, {
 				purgeVault: vi.fn(async () => {}),
 			}),
 			new CloudflareVaultRetentionEmailQueue(notices.queue),

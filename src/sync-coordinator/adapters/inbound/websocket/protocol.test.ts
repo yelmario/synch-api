@@ -6,6 +6,15 @@ import {
 } from "./protocol";
 
 describe("sync protocol schema", () => {
+	it.each([[], [""], Array.from({ length: 101 }, (_, index) => `entry-${index}`)].map((entryIds) => ({ entryIds })))(
+		"rejects invalid recovery entry IDs $entryIds", ({ entryIds }) => {
+			expect(parseClientControlMessage({
+				type: "list_entry_states", requestId: "recovery", sinceCursor: 0,
+				targetCursor: null, after: null, limit: 100, entryIds,
+			}).success).toBe(false);
+		},
+	);
+
 	it("accepts a valid hello message", () => {
 		const parsed = parseClientControlMessage({
 			type: "hello",
@@ -318,4 +327,56 @@ describe("sync protocol schema", () => {
 			"mutations.0.blobId",
 		);
 	});
+
+	it("accepts presence watch and update messages", () => {
+		const watch = parseClientControlMessage({
+			type: "watch_presence",
+			entryIds: ["entry-1", "entry-2"],
+		});
+		expect(watch.success).toBe(true);
+		expect(
+			parseClientControlMessage({
+				type: "watch_presence",
+				entryId: "entry-1",
+			}).success,
+		).toBe(false);
+
+		const update = parseClientControlMessage({
+			type: "presence_update",
+			entryId: "entry-1",
+			selection: presenceSelection(3, 4),
+		});
+		expect(update.success).toBe(true);
+		if (!update.success) {
+			throw new Error("expected presence update to parse");
+		}
+		expect(update.data).toEqual({
+			type: "presence_update",
+			entryId: "entry-1",
+			selection: presenceSelection(3, 4),
+		});
+
+		const clear = parseClientControlMessage({
+			type: "presence_clear",
+		});
+		expect(clear.success).toBe(true);
+
+		const unwatch = parseClientControlMessage({ type: "unwatch_presence" });
+		expect(unwatch.success).toBe(true);
+	});
+
+	it("rejects a presence update without an active file", () => {
+		const parsed = parseClientControlMessage({
+			type: "presence_update",
+			entryId: "entry-1",
+		});
+		expect(parsed.success).toBe(false);
+	});
 });
+
+function presenceSelection(line: number, ch: number) {
+	return {
+		anchor: { line, ch },
+		head: { line, ch },
+	};
+}

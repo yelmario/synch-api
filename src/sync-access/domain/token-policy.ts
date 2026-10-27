@@ -1,12 +1,16 @@
-/** Runtime-neutral claims accepted by the sync token boundary. */
 export type SyncTokenClaimValues = {
+	accessVersion?: number;
 	sub: string;
 	vaultId: string;
 	localVaultId: string;
+	displayName: string;
 	scope: "vault:sync";
 	iat: number;
 	exp: number;
 };
+
+/** Default lifetime for short-lived sync tokens; configurable via env. */
+export const DEFAULT_SYNC_TOKEN_TTL_SECONDS = 120;
 
 /**
  * Mirrors the existing JWT claim validation without bringing a schema/runtime
@@ -39,10 +43,13 @@ export function parseSyncTokenClaimValues(value: unknown): SyncTokenClaimValues 
 		return null;
 	}
 
+	if (claims.accessVersion !== undefined && (typeof claims.accessVersion !== "number" || !Number.isSafeInteger(claims.accessVersion) || claims.accessVersion < 1)) return null;
 	return {
+		...(claims.accessVersion === undefined ? {} : { accessVersion: claims.accessVersion }),
 		sub,
 		vaultId,
 		localVaultId,
+		displayName: typeof claims.displayName === "string" ? claims.displayName.trim() : "",
 		scope: "vault:sync",
 		iat: claims.iat,
 		exp: claims.exp,

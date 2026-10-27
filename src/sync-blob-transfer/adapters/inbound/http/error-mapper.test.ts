@@ -4,16 +4,16 @@ import { BlobTransferApplicationError } from "../../../application/errors/blob-t
 import { mapBlobTransferApplicationError } from "./error-mapper";
 
 describe("mapBlobTransferApplicationError", () => {
-	it("maps paused-vault staging rejections to 403 forbidden", async () => {
+	it("temporarily maps paused uploads to the legacy quota terminal-stop response", async () => {
 		const response = mapBlobTransferApplicationError(
 			new BlobTransferApplicationError("coordinator_stage_rejected", {
-				reason: "forbidden",
+				reason: "sync_paused",
 				message: "vault sync is temporarily paused for repair",
 			}),
 		);
 
-		expect(response?.status).toBe(403);
-		await expect(response?.json()).resolves.toMatchObject({ error: "forbidden" });
+		expect(response?.status).toBe(413);
+		await expect(response?.json()).resolves.toMatchObject({ error: "quota_exceeded", reason: "sync_paused" });
 	});
 
 	it("maps coordinator error codes when the stage body has no reason", async () => {

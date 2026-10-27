@@ -1,14 +1,19 @@
+import { createPasswordWrappedRemoteVaultKey, unwrapRemoteVaultKeyWithPassword } from "../../../../packages/vault-crypto/src/crypto";
+import { SharingClient } from "../../../../packages/sync-client/src/sharing/client";
+import { SharingManager, type StoredKeyReceiver } from "../../../../packages/sync-client/src/sharing/manager";
+import type { HttpClient } from "../../../../packages/sync-client/src/http/request";
 import { serve, type ServerType } from "@hono/node-server";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 
-import { createNodeRuntime, type NodeRuntime } from "../../src/runtime/node";
+import { createNodeRuntime } from "../../src/runtime/node";
 import { createNodeWebSocketUpgradeHandler } from "../../src/runtime/node-websocket";
 import { LocalDiskBlobObjectStorage } from "../../src/sync-blob-transfer/adapters/outbound/local-disk-object-storage";
 import {
@@ -87,7 +92,7 @@ async function bootServer(existingDataDir?: string) {
 		dataDir,
 		publicUrl: baseUrl,
 		betterAuthSecret: "test-secret-test-secret-test-secret",
-		authAllowedEmails: SELF_HOST_ALLOWED_EMAIL,
+		authAllowedEmails: `${SELF_HOST_ALLOWED_EMAIL},member@test.invalid`,
 		syncTokenSecret: "test-sync-token-secret-test-sync",
 		blobStorage: new LocalDiskBlobObjectStorage(path.join(dataDir, "blobs")),
 	});
@@ -129,7 +134,7 @@ async function waitForHealth(baseUrl: string, deadline = Date.now() + 10_000): P
  * uncheckpointed `-wal` file behind, which is the actual crash-recovery path
  * `locking_mode = EXCLUSIVE` + WAL replay needs to be exercised against.
  */
-async function bootSubprocessServer(dataDir: string): Promise<{ baseUrl: string; child: ChildProcess }> {
+async function bootSubprocessServer(dataDir: string, extraEnv: Record<string, string> = {}): Promise<{ baseUrl: string; child: ChildProcess }> {
 	const port = await reserveFreePort();
 	const baseUrl = `http://127.0.0.1:${port}`;
 	// `detached: true` makes this child the leader of its own process group.
@@ -148,6 +153,7 @@ async function bootSubprocessServer(dataDir: string): Promise<{ baseUrl: string;
 			BETTER_AUTH_SECRET: "test-secret-test-secret-test-secret",
 			AUTH_ALLOWED_EMAILS: SELF_HOST_ALLOWED_EMAIL,
 			SYNC_TOKEN_SECRET: "test-sync-token-secret-test-sync",
+			...extraEnv,
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 		detached: true,
@@ -284,6 +290,178 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 		cleanup = [];
 	});
 
+    it("shares retained history through personal passwords, recovers with approval, and closes revoked sockets", async () => {
+      const { baseUrl, dataDir, runtime, server, wss } = await bootServer();
+      cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+      cleanup.push(() => runtime.dispose());
+      cleanup.push(() => closeServer(server, wss));
+      const owner = await signUpAndCreateVault(baseUrl);
+      const signed = await fetch(`${baseUrl}/api/auth/sign-up/email`, { method: "POST", headers: { "content-type": "application/json", origin: baseUrl }, body: JSON.stringify({ email: "member@test.invalid", password: "another correct horse battery", name: "Member" }) });
+      expect(signed.status).toBe(200);
+      const memberCookie = signed.headers.get("set-cookie")!.split(";")[0];
+      const signup = await signed.json() as { user: { id: string } };
+      const userId = signup.user.id;
+      const request = async (cookie: string, path: string, method = "GET", body?: unknown) => {
+        const response = await fetch(`${baseUrl}${path}`, { method, headers: { cookie, origin: baseUrl, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+        return { response, json: await response.json() as Record<string, any> };
+      };
+      const ownerIdentity = await request(owner.sessionCookie, "/api/auth/get-session");
+      const organizationId = (await request(owner.sessionCookie, "/v1/organizations")).json.organizations[0].id as string;
+      const wrapped = await createPasswordWrappedRemoteVaultKey("owner keeps a private passphrase");
+      const created = await request(owner.sessionCookie, "/v1/vaults", "POST", { name: "Shared history", organizationId, initialWrapper: { kind: "password", envelope: wrapped.envelope } });
+      expect(created.response.status).toBe(201);
+      const vaultId = created.json.vault.id as string;
+      const ownerToken = await issueSyncToken(baseUrl, owner.sessionCookie, vaultId, "owner-device");
+      const ownerSocket = await connectSocket(baseUrl, vaultId, ownerToken); cleanup.push(() => ownerSocket.terminate());
+      ownerSocket.send(JSON.stringify({ type: "hello", requestId: "hello-owner", lastKnownCursor: 0 })); await nextMessage(ownerSocket, message => message.type === "hello_ack");
+      for (let revision = 0; revision < 2; revision++) {
+        await uploadBlob(baseUrl, ownerToken, vaultId, `history-${revision}`, `encrypted historical content ${revision}`);
+        ownerSocket.send(JSON.stringify({ type: "commit_mutations", requestId: `commit-${revision}`, mutations: [{ mutationId: `mutation-${revision}`, entryId: "shared-file", op: "upsert", baseRevision: revision, blobId: `history-${revision}`, encryptedMetadata: `metadata-${revision}` }] }));
+        await nextMessage(ownerSocket, message => message.type === "commit_mutations_committed");
+      }
+      const invite = await request(owner.sessionCookie, `/v1/organizations/${organizationId}/invitations`, "POST", { email: "member@test.invalid", role: "member" });
+      expect(invite.response.status).toBe(201);
+      expect((await request(memberCookie, `/v1/invitations/${invite.json.id}/accept`, "POST")).response.status).toBe(200);
+      expect((await request(memberCookie, `/v1/vaults/${vaultId}/bootstrap`)).response.status).toBe(403);
+      expect((await request(memberCookie, `/v1/vaults/${owner.vaultId}/bootstrap`)).response.status).toBe(403);
+      let loseCompleteResponse = true;
+      const http = (cookie: string): HttpClient => ({ request: async input => {
+        const headers = new Headers(input.headers); headers.delete("authorization"); headers.set("cookie", cookie); headers.set("origin", baseUrl);
+        const response = await fetch(input.url, { method: input.method, headers, body: input.body });
+        const json = await response.json();
+        if (cookie === memberCookie && input.url.endsWith("/complete") && loseCompleteResponse && response.ok) { loseCompleteResponse = false; throw new Error("response lost"); }
+        return { status: response.status, json };
+      } });
+      const secrets = new Map<string, StoredKeyReceiver>();
+      const secretStore = { read: async (scope: string) => secrets.get(scope) ?? null, write: async (scope: string, value: StoredKeyReceiver | null) => { if (value) secrets.set(scope, value); else secrets.delete(scope); } };
+      const memberClient = new SharingClient(http(memberCookie), baseUrl, "cookie-auth");
+      let receiver = new SharingManager(memberClient, userId, secretStore);
+      const sender = new SharingManager(new SharingClient(http(owner.sessionCookie), baseUrl, "cookie-auth"), ownerIdentity.json.user.id, secretStore);
+      const pending = await receiver.begin(vaultId);
+      await expect(sender.approve(pending, wrapped.remoteVaultKey, "wrong-code")).rejects.toThrow("verification code");
+      await sender.approve(pending, wrapped.remoteVaultKey, await receiver.verificationCode(pending));
+      const password = "member has a separate passphrase";
+      await expect(receiver.receive(vaultId, password, password)).rejects.toThrow("response lost");
+      // Recreate the manager to model a device restart after an ambiguous response.
+      receiver = new SharingManager(memberClient, userId, secretStore);
+      await receiver.receive(vaultId, password, password);
+      expect(secrets.size).toBe(0);
+      const bootstrap = (await request(memberCookie, `/v1/vaults/${vaultId}/bootstrap`)).json;
+      expect(bootstrap.wrappers).toHaveLength(1); expect(bootstrap.wrappers[0].userId).toBe(userId);
+      expect(await unwrapRemoteVaultKeyWithPassword(password, bootstrap.wrappers[0].envelope, { vaultId, userId })).toEqual(wrapped.remoteVaultKey);
+      const recovery = await receiver.begin(vaultId); expect(recovery.purpose).toBe("recovery");
+      await sender.approve(recovery, wrapped.remoteVaultKey, await receiver.verificationCode(recovery));
+      const recoveredPassword = "a freshly recovered personal phrase";
+      await receiver.receive(vaultId, recoveredPassword, recoveredPassword);
+      await receiver.changePassword(vaultId, wrapped.remoteVaultKey, "another personally chosen phrase", "another personally chosen phrase");
+      const ownerBootstrap = (await request(owner.sessionCookie, `/v1/vaults/${vaultId}/bootstrap`)).json;
+      expect(ownerBootstrap.wrappers[0].envelope).toEqual(wrapped.envelope);
+      const token = await issueSyncToken(baseUrl, memberCookie, vaultId, "member-device");
+      const memberSocket = await connectSocket(baseUrl, vaultId, token); cleanup.push(() => memberSocket.terminate());
+      memberSocket.send(JSON.stringify({ type: "hello", requestId: "hello-member", lastKnownCursor: 0 })); await nextMessage(memberSocket, message => message.type === "hello_ack");
+      memberSocket.send(JSON.stringify({ type: "list_entry_versions", requestId: "history", entryId: "shared-file", before: null, limit: 10 }));
+      const history = await nextMessage(memberSocket, message => message.type === "entry_versions_listed");
+      expect(history).toMatchObject({ versions: expect.arrayContaining([expect.objectContaining({ blobId: "history-1" })]) });
+      const closed = new Promise<number>(resolve => memberSocket.once("close", code => resolve(code)));
+      expect((await request(owner.sessionCookie, `/v1/organizations/${organizationId}/members/${userId}`, "DELETE")).response.status).toBe(200);
+      expect(await closed).toBe(1012);
+      const deniedBlob = await fetch(`${baseUrl}/v1/vaults/${vaultId}/blobs/history-1`, { headers: { authorization: `Bearer ${token}` } });
+      expect(deniedBlob.status).toBe(403);
+      expect((await request(memberCookie, "/v1/sync/token", "POST", { vaultId, localVaultId: "member-device" })).response.status).toBe(403);
+      expect((await request(memberCookie, `/v1/invitations/${invite.json.id}/accept`, "POST")).response.status).toBe(200);
+      expect((await request(memberCookie, `/v1/vaults/${vaultId}/bootstrap`)).response.status).toBe(403);
+      for (const page of ["organizations", "invitations"]) expect((await fetch(`${baseUrl}/${page}`)).status).toBe(200);
+    }, 20000);
+
+	it("cleans orphaned upload parts before serving after a process crash", async () => {
+		const dataDir = mkdtempSync(path.join(tmpdir(), "synch-orphan-upload-"));
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		const first = await bootSubprocessServer(dataDir);
+		cleanup.push(() => killAndWaitForExit(first.child));
+		const blobDir = path.join(dataDir, "blobs");
+		mkdirSync(path.join(blobDir, "vault"), { recursive: true });
+		writeFileSync(path.join(blobDir, "vault", "complete"), "good");
+		writeFileSync(path.join(blobDir, ".uploads", "interrupted.part"), "partial");
+		await killAndWaitForExit(first.child);
+		const second = await bootSubprocessServer(dataDir);
+		cleanup.push(() => killAndWaitForExit(second.child));
+		expect(readdirSync(path.join(blobDir, ".uploads")).filter(name => name.endsWith(".part"))).toEqual([]);
+		expect(readFileSync(path.join(blobDir, "vault", "complete"), "utf8")).toBe("good");
+	});
+
+	it.each(["timeout", "disconnect"] as const)("survives five concurrent upload failures (%s), then retries after restart", async (mode) => {
+		const dataDir = mkdtempSync(path.join(tmpdir(), "synch-interrupted-upload-"));
+		cleanup.push(() => rmSync(dataDir, { recursive: true, force: true }));
+		const first = await bootSubprocessServer(dataDir, { REQUEST_TIMEOUT_MS: "2000", SYNC_TOKEN_TTL_SECONDS: "2" });
+		cleanup.push(() => killAndWaitForExit(first.child));
+		const { sessionCookie, vaultId } = await signUpAndCreateVault(first.baseUrl);
+		const token = await issueSyncToken(first.baseUrl, sessionCookie, vaultId, "device-a");
+		const device = await connectSocket(first.baseUrl, vaultId, token);
+		cleanup.push(() => device.close());
+		device.send(JSON.stringify({ type: "hello", requestId: "hello", lastKnownCursor: 0 }));
+		await nextMessage(device, (m) => m.type === "hello_ack");
+		// Internal compensation and administrator repair stay private in self-hosting.
+		expect((await fetch(`${first.baseUrl}/internal/v1/vaults/${vaultId}/blobs/interrupted-0/stage`, { method: "DELETE" })).status).toBe(404);
+		expect((await fetch(`${first.baseUrl}/admin/v1/vaults/${vaultId}/sync-repair`, { method: "POST" })).status).toBe(404);
+		const sizes = [6, 10, 11, 11, 16].map((mb) => mb * 1024 * 1024);
+		const responses = await Promise.all(sizes.map((size, i) => new Promise<number | null>((resolve, reject) => {
+			const req = httpRequest(`${first.baseUrl}/v1/vaults/${vaultId}/blobs/interrupted-${i}`, {
+				method: "PUT", headers: { authorization: `Bearer ${token}`, "content-length": size, "x-blob-size": size },
+			}, (res) => {
+				res.resume();
+				res.on("end", () => resolve(res.statusCode!));
+			});
+			const timer = setInterval(() => req.write(Buffer.alloc(1024)), 50);
+			const disconnectTimer = mode === "disconnect" ? setTimeout(() => req.destroy(), 200) : undefined;
+			req.on("error", (error: NodeJS.ErrnoException) => {
+				if (mode === "disconnect") resolve(null);
+				else if (error.code !== "ECONNRESET") reject(error);
+			});
+			req.on("close", () => { clearInterval(timer); clearTimeout(disconnectTimer); });
+		})));
+		expect(responses).toEqual(sizes.map(() => mode === "timeout" ? 408 : null));
+		await waitForHealth(first.baseUrl);
+		expect(first.child.exitCode).toBeNull();
+		// The failed attempts must remove incomplete files before restart.
+		await expect.poll(() => listPublicFiles(path.join(dataDir, "blobs"))).toEqual([]);
+		await expect.poll(() => readdirSync(path.join(dataDir, "blobs", ".uploads"))).toEqual([]);
+		// Failed uploads retain their quota reservation until staged-blob GC.
+		const observerToken = await issueSyncToken(first.baseUrl, sessionCookie, vaultId, "observer");
+		const observer = await connectSocket(first.baseUrl, vaultId, observerToken);
+		cleanup.push(() => observer.close());
+		observer.send(JSON.stringify({ type: "hello", requestId: "observer-hello", lastKnownCursor: 0 }));
+		expect(await nextMessage(observer, (m) => m.type === "hello_ack"))
+			.toMatchObject({ storageStatus: { storageUsedBytes: sizes.reduce((sum, size) => sum + size, 0) } });
+		await killAndWaitForExit(first.child);
+		const second = await bootSubprocessServer(dataDir);
+		cleanup.push(() => killAndWaitForExit(second.child));
+		const retryToken = await issueSyncToken(second.baseUrl, sessionCookie, vaultId, "device-a");
+		// Retry the same blob IDs with complete bodies, in parallel, at a bounded rate.
+		await Promise.all(sizes.map(async (size, i) => {
+			const payload = Buffer.alloc(size, i + 1);
+			const url = `${second.baseUrl}/v1/vaults/${vaultId}/blobs/interrupted-${i}`;
+			await new Promise<void>((resolve, reject) => {
+				const req = httpRequest(url, { method: "PUT", headers: { authorization: `Bearer ${retryToken}`, "x-blob-size": size, "content-length": size } }, res => {
+					res.resume();
+					res.on("end", () => res.statusCode === 201 ? resolve() : reject(new Error(`upload status ${res.statusCode}`)));
+				});
+				let offset = 0;
+				const timer = setInterval(() => {
+					if (req.writableNeedDrain) return;
+					const end = Math.min(offset + 256 * 1024, size);
+					req.write(payload.subarray(offset, end));
+					offset = end;
+					if (offset === size) { clearInterval(timer); req.end(); }
+				}, 10);
+				req.on("error", reject);
+				req.on("close", () => clearInterval(timer));
+			});
+			const downloaded = await fetch(url, { headers: { authorization: `Bearer ${retryToken}` } });
+			expect(downloaded.status).toBe(200);
+			expect(Buffer.from(await downloaded.arrayBuffer()).equals(payload)).toBe(true);
+		}));
+	}, 40_000);
+
 	it("serves the auth pages Cloudflare would otherwise serve via its assets binding", async () => {
 		// On Cloudflare, wrangler.jsonc's "assets" binding serves apps/api/public/*
 		// ahead of the Worker - the device-authorization flow's verification URI
@@ -297,7 +475,7 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 		cleanup.push(() => closeServer(server, wss));
 
 		const publicFiles = listPublicFiles(path.join(API_ROOT, "public"));
-		expect(publicFiles).toEqual(expect.arrayContaining(["styles.css", "favicon.ico"]));
+		expect(publicFiles).toEqual(expect.arrayContaining(["favicon.ico"]));
 
 		for (const file of publicFiles) {
 			const urlPath = `/${file}`;
@@ -317,7 +495,7 @@ describe("self-hosted Node runtime: end-to-end sync", () => {
 			}
 		}
 
-		for (const page of ["/device", "/signin", "/signup", "/vaults"]) {
+		for (const page of ["/device", "/signin", "/signup", "/vaults", "/organizations", "/invitations"]) {
 			const response = await fetch(`${baseUrl}${page}`);
 			expect(response.status, page).toBe(200);
 			expect(response.headers.get("content-type"), page).toMatch(/^text\/html/);
